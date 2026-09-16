@@ -40,41 +40,40 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Resolve and install Android SDK packages
+      - name: Install build host tools
         run: |
-          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zsh jq
+
+      - name: Install Android SDK packages
+        run: |
+          set -u
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKM" ] || SDKM="$(find "$SDK" -path '*cmdline-tools*/bin/sdkmanager' -print -quit)"
           echo "SDK root: $SDK"
           echo "sdkmanager: $SDKM"
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-          LIST="$("$SDKM" --list 2>/dev/null || true)"
-          avail() { printf '%s\n' "$LIST" | awk -v p="$1" '$1 ~ "^"p {print $1}' | sort -uV; }
-          echo "--- available platforms (tail) ---"; avail 'platforms;android-' | tail -8
-          echo "--- available build-tools (tail) ---"; avail 'build-tools;' | tail -8
-          echo "--- available ndk 27 ---"; avail 'ndk;27' || true
-          PLAT="$(avail 'platforms;android-' | tail -1)"
-          BT="$(avail 'build-tools;3' | tail -1)"
-          NDK="$(avail 'ndk;27\.1\.12297006' | tail -1)"
-          [ -n "$NDK" ] || NDK="$(avail 'ndk;27' | tail -1)"
-          echo "chosen platform=$PLAT buildtools=$BT ndk=$NDK"
-          for p in "$PLAT" "$BT" "$NDK" 'cmake;3.22.1'; do
-            [ -n "$p" ] || continue
+          # The project pins compileSdk 37 / build-tools 37.0.0. The SDK now
+          # names 37 as 37.0; install the stable line plus the 36 fallback.
+          for p in "platforms;android-37.0" "build-tools;37.0.0" "platforms;android-36" "build-tools;36.1.0" "ndk;27.1.12297006" "cmake;3.22.1"; do
+            echo "::group::sdkmanager --install $p"
             "$SDKM" --install "$p" || echo "::warning::could not install $p"
+            echo "::endgroup::"
           done
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          API="${PLAT#platforms;android-}"
-          BTVER="${BT#build-tools;}"
-          if [ "$API" != "37" ]; then
-            sed -i "s/compileSdkVersion = 37/compileSdkVersion = $API/" apps/mobile/android/build.gradle
+          echo "--- installed platforms ---"; ls "$SDK/platforms" || true
+          for d in "$SDK"/platforms/*; do
+            echo "$d: $(sed -n 's/^AndroidVersion\.\(ApiLevel\|MinorApiLevel\)=/\1=/p' "$d/source.properties" 2>/dev/null | tr '\n' ' ')"
+          done
+          # Gradle looks up platforms/android-<compileSdk>; alias a 37.0 install
+          # to the plain 37 path when the SDK used the minor-version layout.
+          if [ -d "$SDK/platforms/android-37.0" ] && [ ! -d "$SDK/platforms/android-37" ]; then
+            ln -s "$SDK/platforms/android-37.0" "$SDK/platforms/android-37" || true
           fi
-          if [ -n "$BTVER" ] && [ "$BTVER" != "37.0.0" ]; then
-            sed -i "s/buildToolsVersion = \"37.0.0\"/buildToolsVersion = \"$BTVER\"/" apps/mobile/android/build.gradle
-          fi
-          echo "--- patched build.gradle ---"; sed -n '1,12p' apps/mobile/android/build.gradle
-          if [ "$NDK" = "ndk;27.1.12297006" ]; then
+          echo "--- platforms after aliasing ---"; ls "$SDK/platforms" || true
+          if [ -d "$SDK/ndk/27.1.12297006" ]; then
             echo "ANDROID_NDK_HOME=$SDK/ndk/27.1.12297006" >> "$GITHUB_ENV"
             echo "RISH_GUEST_OK=1" >> "$GITHUB_ENV"
           else
@@ -114,27 +113,36 @@ jobs:
       - name: Assemble the debug APK
         working-directory: apps/mobile/android
         run: |
+          set -u
           chmod +x gradlew
-          ./gradlew --no-daemon :app:assembleDebug \
-            -PrishStandalone=true \
-            -PreactNativeArchitectures=arm64-v8a \
-            --stacktrace
+          ARGS=":app:assembleDebug -PrishStandalone=true -PreactNativeArchitectures=arm64-v8a --stacktrace --no-daemon"
+          if ./gradlew $ARGS; then
+            echo "BUILD_SDK=37" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "::warning::compileSdk 37 build failed; retrying with compileSdk 36"
+          sed -i 's/compileSdkVersion = 37/compileSdkVersion = 36/; s/buildToolsVersion = "37.0.0"/buildToolsVersion = "36.1.0"/' build.gradle
+          ./gradlew $ARGS
+          echo "BUILD_SDK=36" >> "$GITHUB_ENV"
 
       - name: Collect the APK
         if: always()
         run: |
           mkdir -p out
           find apps/mobile/android/app/build/outputs -name '*.apk' -exec cp {} out/ \; || true
-          ls -l out
-          for f in out/*.apk; do sha256sum "$f" > "$f.sha256"; done
+          ls -l out || true
+          ( cd out && for f in *.apk; do [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done ) || true
           cat out/*.sha256 2>/dev/null || true
-          echo "guest_runtime_staged=$([ -f apps/mobile/android/rish-ffi/rish_ffi.version ] && echo yes || echo no)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "guest_runtime_staged=$([ -f apps/mobile/android/rish-ffi/rish_ffi.version ] && echo yes || echo no)"
+            echo "agent_core_staged=$([ -f apps/mobile/android/rish-agent-core/rish_agent_core.version ] && echo yes || echo no)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rish-apk-arm64
-          path: out/*
+          path: out/
           if-no-files-found: warn
           retention-days: 30
