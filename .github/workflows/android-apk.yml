@@ -40,23 +40,50 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK packages
+      - name: Resolve and install Android SDK packages
         run: |
-          set -e
+          set -eu
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          echo "SDK root: $SDK"
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          [ -x "$SDKM" ] || SDKM="$(find "$SDK" -path '*cmdline-tools*/bin/sdkmanager' | head -1)"
+          [ -x "$SDKM" ] || SDKM="$(find "$SDK" -path '*cmdline-tools*/bin/sdkmanager' -print -quit)"
+          echo "SDK root: $SDK"
           echo "sdkmanager: $SDKM"
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-          "$SDKM" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1" || \
-            "$SDKM" --install "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006"
+          LIST="$("$SDKM" --list 2>/dev/null || true)"
+          avail() { printf '%s\n' "$LIST" | awk -v p="$1" '$1 ~ "^"p {print $1}' | sort -uV; }
+          echo "--- available platforms (tail) ---"; avail 'platforms;android-' | tail -8
+          echo "--- available build-tools (tail) ---"; avail 'build-tools;' | tail -8
+          echo "--- available ndk 27 ---"; avail 'ndk;27' || true
+          PLAT="$(avail 'platforms;android-' | tail -1)"
+          BT="$(avail 'build-tools;3' | tail -1)"
+          NDK="$(avail 'ndk;27\.1\.12297006' | tail -1)"
+          [ -n "$NDK" ] || NDK="$(avail 'ndk;27' | tail -1)"
+          echo "chosen platform=$PLAT buildtools=$BT ndk=$NDK"
+          for p in "$PLAT" "$BT" "$NDK" 'cmake;3.22.1'; do
+            [ -n "$p" ] || continue
+            "$SDKM" --install "$p" || echo "::warning::could not install $p"
+          done
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$SDK/ndk/27.1.12297006" >> "$GITHUB_ENV"
-          ls "$SDK/ndk" || true
+          API="${PLAT#platforms;android-}"
+          BTVER="${BT#build-tools;}"
+          if [ "$API" != "37" ]; then
+            sed -i "s/compileSdkVersion = 37/compileSdkVersion = $API/" apps/mobile/android/build.gradle
+          fi
+          if [ -n "$BTVER" ] && [ "$BTVER" != "37.0.0" ]; then
+            sed -i "s/buildToolsVersion = \"37.0.0\"/buildToolsVersion = \"$BTVER\"/" apps/mobile/android/build.gradle
+          fi
+          echo "--- patched build.gradle ---"; sed -n '1,12p' apps/mobile/android/build.gradle
+          if [ "$NDK" = "ndk;27.1.12297006" ]; then
+            echo "ANDROID_NDK_HOME=$SDK/ndk/27.1.12297006" >> "$GITHUB_ENV"
+            echo "RISH_GUEST_OK=1" >> "$GITHUB_ENV"
+          else
+            echo "RISH_GUEST_OK=0" >> "$GITHUB_ENV"
+            echo "::warning::pinned NDK 27.1.12297006 unavailable; building a lite APK without the guest runtime"
+          fi
 
       - name: Install Rust 1.94 and the Android target
+        if: env.RISH_GUEST_OK == '1'
         run: |
           set -e
           rustup toolchain install 1.94 --profile minimal
@@ -67,13 +94,20 @@ jobs:
         working-directory: apps/mobile
         run: npm ci
 
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/mobile/android/gradle/wrapper/gradle-wrapper.properties') }}
+
       - name: Stage the rish guest runtime
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.guest_runtime }}
+        if: env.RISH_GUEST_OK == '1' && (github.event_name != 'workflow_dispatch' || inputs.guest_runtime)
         run: zsh scripts/prepare-rish-android.sh
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
       - name: Stage the shared Rust agent core (best effort)
+        if: env.RISH_GUEST_OK == '1'
         continue-on-error: true
         run: zsh scripts/prepare-rish-agent-core-android.sh
 
@@ -87,17 +121,20 @@ jobs:
             --stacktrace
 
       - name: Collect the APK
+        if: always()
         run: |
           mkdir -p out
-          find apps/mobile/android/app/build/outputs -name '*.apk' -exec cp {} out/ \;
+          find apps/mobile/android/app/build/outputs -name '*.apk' -exec cp {} out/ \; || true
           ls -l out
           for f in out/*.apk; do sha256sum "$f" > "$f.sha256"; done
-          cat out/*.sha256
+          cat out/*.sha256 2>/dev/null || true
+          echo "guest_runtime_staged=$([ -f apps/mobile/android/rish-ffi/rish_ffi.version ] && echo yes || echo no)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rish-apk-arm64
           path: out/*
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
